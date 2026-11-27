@@ -1,0 +1,428 @@
+import pandas as pd
+import numpy as np
+import heapq
+from pathlib import Path
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import warnings
+warnings.filterwarnings("ignore")
+
+ROOT = Path(__file__).parent.parent.parent
+DATA_DIR   = ROOT / 'data'
+OUTPUT_DIR = ROOT / 'output' / 'reDistribucionSinExclusivos'
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- CONFIGURATION MODULE ---
+class RedistConfig:
+    csvPath = DATA_DIR / '2_dataset_procesado_actualizado.csv'
+    targetWeekStart = '2023-04-17 00:00:00'
+
+    # Redistribution Parameters
+    weeksToCollapse = 5
+    simDays = 5
+
+    # OR Allocation Parameters
+    totalOrs = 10
+    urgencyOrs = 1   # ORs 0 and 1 dedicated to urgencies
+    electiveOrs = 9  # ORs 2 to 9 dedicated to electives
+
+    # Time Constraints
+    urgencyStartHour = 0
+    urgencyEndHour = 24
+    shiftOverflowDelta = 1  # Allows 2 extra hours for urgencies if needed
+
+    electiveStartHour = 8
+    electiveEndHour = 16
+
+    heuristics = ["FIFO", "SPT", "LPT"]
+    strategies = ["VERTICAL", "HORIZONTAL"]
+
+# --- DATA MODELS ---
+class RedistSurgery:
+    def __init__(self, surgeryId, isUrgency, durationMins, arrivalTime, requestDate, originWeek):
+        self.surgeryId = surgeryId
+        self.isUrgency = isUrgency
+        self.durationMins = durationMins
+        self.arrivalTime = arrivalTime
+        self.requestDate = requestDate
+        self.originWeek = originWeek
+
+        self.assignedOr = None
+        self.startTime = None
+        self.endTime = None
+        self.leadTimeDays = 0.0
+
+class SimEvent:
+    def __init__(self, time, eventType, payload=None):
+        self.time = time
+        self.eventType = eventType
+        self.payload = payload
+
+    def __lt__(self, other):
+        return self.time < other.time
+
+# --- DATA PROCESSING ---
+def loadRedistData(config: RedistConfig) -> tuple[list[RedistSurgery], list[RedistSurgery], datetime]:
+    df = pd.read_csv(config.csvPath, low_memory=False)
+
+    # 1. Identificamos dinámicamente las columnas correctas en español
+    if 'Ingreso Quirófano' in df.columns:
+        colIngreso = 'Ingreso Quirófano'
+    elif 'Ingreso Pabellón' in df.columns:
+        colIngreso = 'Ingreso Pabellón'
+    else:
+        colIngreso = 'Fecha de Pabellón'
+
+    colId = 'Número' if 'Número' in df.columns else 'idOperacion'
+    colPabellon = 'Pabellón' if 'Pabellón' in df.columns else 'pabellon'
+
+    # 2. Construimos el mapa de columnas hacia nuestro estándar interno en inglés
+    columnMap = {
+        colIngreso: 'ingresoQuirofano',
+        'Tiempo Intervención': 'tiempoIntervencion',
+        'Tipo Atención': 'tipoAtencion',
+        colId: 'idOperacion',
+        colPabellon: 'pabellon'
+    }
+
+    if 'fechaSolicitud' in df.columns:
+        columnMap['fechaSolicitud'] = 'fechaSolicitud'
+
+    # Filtramos y aplicamos el renombramiento
+    columnMap = {k: v for k, v in columnMap.items() if k in df.columns}
+    df.rename(columns=columnMap, inplace=True)
+
+    # Prevención del ValueError por columnas duplicadas en el CSV original
+    if isinstance(df.get('ingresoQuirofano'), pd.DataFrame):
+        df['ingresoQuirofano'] = df['ingresoQuirofano'].iloc[:, 0]
+
+    # 3. Parseamos las fechas
+    df['ingresoQuirofano'] = pd.to_datetime(df['ingresoQuirofano'], errors='coerce')
+
+    if 'fechaSolicitud' in df.columns:
+        df['fechaSolicitud'] = pd.to_datetime(df['fechaSolicitud'], errors='coerce')
+    else:
+        df['fechaSolicitud'] = df['ingresoQuirofano']
+
+    # Descartamos registros sin fecha o duración válida
+    df.dropna(subset=['ingresoQuirofano', 'tiempoIntervencion'], inplace=True)
+
+    simStart = pd.to_datetime(config.targetWeekStart)
+    baseWeekStart = df['ingresoQuirofano'].min().replace(hour=0, minute=0, second=0)
+
+    urgencies = []
+    electives = []
+
+    for i, row in df.iterrows():
+        arrival = row['ingresoQuirofano']
+
+        daysDiff = (arrival.date() - baseWeekStart.date()).days
+        originWeek = daysDiff // 7
+
+        # Filtramos si la operación está más allá de la cantidad de semanas a colapsar
+        if originWeek >= config.weeksToCollapse:
+            continue
+
+        # Colapsamos la fecha respetando el día de la semana y la hora
+        collapsedDays = daysDiff % 7
+        collapsedArrival = simStart + timedelta(days=collapsedDays)
+        collapsedArrival = collapsedArrival.replace(hour=arrival.hour, minute=arrival.minute, second=0)
+
+        reqDate = row.get('fechaSolicitud', collapsedArrival)
+        if pd.isna(reqDate): reqDate = collapsedArrival
+
+        tipo = str(row.get('tipoAtencion', '')).upper()
+        isUrg = 'URGENCIA' in tipo
+
+        surg = RedistSurgery(
+            surgeryId=str(row.get('idOperacion', i)),
+            isUrgency=isUrg,
+            durationMins=float(row['tiempoIntervencion']),
+            arrivalTime=collapsedArrival,
+            requestDate=reqDate,
+            originWeek=originWeek
+        )
+
+        if isUrg:
+            urgencies.append(surg)
+        else:
+            # Las electivas se inyectan al inicio de la simulación para someterse a las heurísticas
+            surg.arrivalTime = simStart
+            electives.append(surg)
+
+    return urgencies, electives, simStart
+
+# --- DISCRETE EVENT ENGINE ---
+class RedistEngine:
+    def __init__(self, urgencies: list[RedistSurgery], electives: list[RedistSurgery], simStart: datetime, heuristic: str, strategy: str, config: RedistConfig):
+        self.config = config
+        self.simStart = simStart
+        self.simEnd = simStart + timedelta(days=config.simDays)
+        self.heuristic = heuristic
+        self.strategy = strategy
+
+        # Priority queues matching business rules and tie-breakers
+        self.pendingUrgencies = sorted(urgencies, key=lambda x: (x.arrivalTime, x.originWeek))
+        self.pendingElectives = list(electives)
+        self._sortElectives()
+
+        self.activeUrgencies = []
+        self.completedSurgeries = []
+
+        self.orFreeTime = {i: simStart for i in range(config.totalOrs)}
+        self.events = []
+
+        # Seed initial events
+        for u in self.pendingUrgencies:
+            heapq.heappush(self.events, SimEvent(u.arrivalTime, 'URG_ARRIVAL', u))
+
+        for i in range(config.totalOrs):
+            heapq.heappush(self.events, SimEvent(simStart, 'OR_FREE', i))
+
+    def _sortElectives(self):
+        if self.heuristic == "FIFO":
+            self.pendingElectives.sort(key=lambda x: (x.requestDate, x.originWeek))
+        elif self.heuristic == "SPT":
+            self.pendingElectives.sort(key=lambda x: (x.durationMins, x.originWeek))
+        elif self.heuristic == "LPT":
+            self.pendingElectives.sort(key=lambda x: (-x.durationMins, x.originWeek))
+
+    def _assign(self, surg: RedistSurgery, orId: int, startTime: datetime):
+        surg.assignedOr = orId
+        surg.startTime = startTime
+        surg.endTime = startTime + timedelta(minutes=surg.durationMins)
+        surg.leadTimeDays = (surg.endTime - surg.arrivalTime).total_seconds() / 86400.0
+
+        self.orFreeTime[orId] = surg.endTime
+        self.completedSurgeries.append(surg)
+        heapq.heappush(self.events, SimEvent(surg.endTime, 'OR_FREE', orId))
+
+    def run(self) -> list[RedistSurgery]:
+        while self.events:
+            e = heapq.heappop(self.events)
+            t = e.time
+
+            if t >= self.simEnd:
+                break
+
+            if e.eventType == 'URG_ARRIVAL':
+                self.activeUrgencies.append(e.payload)
+
+            # 1. ATENCIÓN DE URGENCIAS (Buscan en TODOS los 10 pabellones)
+            freeOrs = [i for i in range(self.config.totalOrs) if self.orFreeTime[i] <= t]
+            validUrgOrs = [i for i in freeOrs if self.config.urgencyStartHour <= t.hour < (self.config.urgencyEndHour + self.config.shiftOverflowDelta)]
+
+            while validUrgOrs and self.activeUrgencies:
+                orId = validUrgOrs.pop(0)
+                surg = self.activeUrgencies.pop(0)
+                self._assign(surg, orId, max(t, self.orFreeTime[orId]))
+
+            # Actualizamos la lista de pabellones libres por si las urgencias tomaron alguno
+            freeOrs = [i for i in range(self.config.totalOrs) if self.orFreeTime[i] <= t]
+
+            # 2. ATENCIÓN DE ELECTIVAS (Buscan en los pabellones restantes)
+            is_elective_time = self.config.electiveStartHour <= t.hour < (self.config.electiveEndHour + self.config.shiftOverflowDelta)
+
+            if not is_elective_time:
+                # Fuera de horario: Solo agendamos un "despertador" para las 08:00 AM
+                # NO bloqueamos orFreeTime, así las urgencias pueden seguir usándolos en la noche
+                if self.pendingElectives:
+                    nextOpen = t.replace(hour=self.config.electiveStartHour, minute=0, second=0)
+                    if t.hour >= (self.config.electiveEndHour + self.config.shiftOverflowDelta):
+                        nextOpen += timedelta(days=1)
+                    heapq.heappush(self.events, SimEvent(nextOpen, 'WAKE_UP'))
+                continue
+
+            if self.strategy == "VERTICAL":
+                for orId in freeOrs:
+                    if not self.pendingElectives: break
+                    propStart = max(t, self.orFreeTime[orId])
+                    surg = self.pendingElectives[0]
+
+                    estimated_end = propStart + timedelta(minutes=surg.durationMins)
+                    limit_time = propStart.replace(hour=self.config.electiveEndHour, minute=0, second=0) + timedelta(hours=self.config.shiftOverflowDelta)
+
+                    if estimated_end <= limit_time:
+                        self.pendingElectives.pop(0)
+                        self._assign(surg, orId, propStart)
+                    else:
+                        # NO cabe. Dejamos el pabellón libre por si llega una urgencia en la noche.
+                        nextOpen = propStart.replace(hour=self.config.electiveStartHour, minute=0, second=0) + timedelta(days=1)
+                        heapq.heappush(self.events, SimEvent(nextOpen, 'WAKE_UP'))
+
+            elif self.strategy == "HORIZONTAL":
+                for orId in freeOrs:
+                    while self.pendingElectives:
+                        propStart = max(t, self.orFreeTime[orId])
+                        surg = self.pendingElectives[0]
+
+                        estimated_end = propStart + timedelta(minutes=surg.durationMins)
+                        limit_time = propStart.replace(hour=self.config.electiveEndHour, minute=0, second=0) + timedelta(hours=self.config.shiftOverflowDelta)
+
+                        if estimated_end > limit_time:
+                            # NO cabe en este pabellón por hoy. Lo dejamos libre para urgencias.
+                            nextOpen = propStart.replace(hour=self.config.electiveStartHour, minute=0, second=0) + timedelta(days=1)
+                            heapq.heappush(self.events, SimEvent(nextOpen, 'WAKE_UP'))
+                            break
+
+                        self.pendingElectives.pop(0)
+                        self._assign(surg, orId, propStart)
+
+        return self.completedSurgeries
+
+# --- METRICS & PLOTTING ---
+def calculateRedistMetrics(surgeries: list[RedistSurgery], config: RedistConfig) -> dict:
+
+    # Filtro estricto: Solo contamos cirugías completadas antes del fin de simulación
+    simEnd = pd.to_datetime(config.targetWeekStart) + timedelta(days=config.simDays)
+    completedInHorizon = [s for s in surgeries if s.endTime <= simEnd]
+
+    throughput = len(completedInHorizon)
+    if throughput == 0:
+        return {"Throughput": 0, "LeadTimeDays": 0.0, "UtilUrg%": 0.0, "UtilElec%": 0.0, "UtilGlobal%": 0.0, "ElecHoursBase": 0}
+
+    leadTimeDays = np.mean([s.leadTimeDays for s in completedInHorizon])
+
+    urgMins = sum(s.durationMins for s in completedInHorizon if s.isUrgency)
+    elecMins = sum(s.durationMins for s in completedInHorizon if not s.isUrgency)
+
+    # Horas base de electivas (ej. 8 a 16 + 1 hora de delta = 9 horas)
+    elecHoursPerDay = (config.electiveEndHour - config.electiveStartHour) + config.shiftOverflowDelta
+
+    # Capacidad Urgencias: 1 pabellón x 24h x 5 días
+    urgCapMins = config.urgencyOrs * (config.urgencyEndHour - config.urgencyStartHour) * config.simDays * 60
+
+    # Capacidad Electivas: 9 pabellones x Turno Hábil x 5 días
+    elecCapMins = config.electiveOrs * elecHoursPerDay * config.simDays * 60
+
+    # Capacidad Total del Hospital (Presupuestada/Estructural)
+    totalCapMins = urgCapMins + elecCapMins
+
+    utilUrg = (urgMins / urgCapMins * 100) if urgCapMins > 0 else 0.0
+    utilElec = (elecMins / elecCapMins * 100) if elecCapMins > 0 else 0.0
+    utilGlobal = ((urgMins + elecMins) / totalCapMins * 100) if totalCapMins > 0 else 0.0
+
+    return {
+        "Throughput": throughput,
+        "LeadTimeDays": round(leadTimeDays, 2),
+        "UtilUrg%": round(utilUrg, 2),
+        "UtilElec%": round(utilElec, 2),
+        "UtilGlobal%": round(utilGlobal, 2),
+        "ElecHoursBase": elecHoursPerDay
+    }
+
+# --- GANTT CHART GENERATION ---
+def drawRedistGantt(surgeries: list[RedistSurgery], config: RedistConfig, scenarioName: str):
+    if not surgeries:
+        print(f"No surgeries to plot for scenario {scenarioName}.")
+        return
+
+    fig, ax = plt.subplots(figsize=(24, 10))
+    ax.set_facecolor("#F8F9FA")
+
+    simStart = pd.to_datetime(config.targetWeekStart)
+    colors = {True: '#D32F2F', False: '#1565C0'}
+
+    for s in surgeries:
+        if s.startTime is None: continue
+
+        orIndex = s.assignedOr
+
+        startHours = (s.startTime - simStart).total_seconds() / 3600.0
+        durationHrs = s.durationMins / 60.0
+
+        ax.barh(
+            orIndex, durationHrs, left=startHours,
+            color=colors[s.isUrgency], edgecolor='white', linewidth=1.2, alpha=0.9, zorder=3
+        )
+
+    # --- Y-Axis Formatting (OR Labels) ---
+    ax.set_yticks(range(config.totalOrs))
+
+    yLabels = [f"OR {i} (Urg)" if i < config.urgencyOrs else f"OR {i} (Elec)" for i in range(config.totalOrs)]
+    ax.set_yticklabels(yLabels, fontweight='bold')
+    ax.set_ylabel("Operating Room", fontweight='bold', labelpad=10)
+
+    # --- X-Axis Formatting (Time Slots) ---
+    totalHours = config.simDays * 24
+    xTicks = np.arange(0, totalHours + 1, 2)
+
+    xLabels = [f"{(int(h) % 24):02d}:00" for h in xTicks]
+
+    ax.set_xticks(xTicks)
+    ax.set_xticklabels(xLabels, fontsize=8, rotation=45)
+    ax.set_xlim(0, totalHours)
+    ax.set_xlabel("Time of Day", fontweight='bold', labelpad=10)
+
+    ax.grid(axis='x', color='#E0E0E0', linestyle='-', linewidth=0.5, zorder=0)
+    ax.grid(axis='y', color='#E0E0E0', linestyle='-', linewidth=0.5, zorder=0)
+
+    dayNames = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+    yMax = config.totalOrs - 0.4
+
+    for d in range(config.simDays):
+        dayStartHour = d * 24
+
+        if d > 0:
+            ax.axvline(x=dayStartHour, color='#A0A0A0', linestyle='--', alpha=0.7, zorder=1)
+
+        currentDate = simStart + timedelta(days=d)
+        dayString = f"{dayNames[currentDate.weekday()]} {currentDate.day} {monthNames[currentDate.month - 1]}"
+        midPoint = dayStartHour + 12
+
+        ax.text(
+            midPoint, yMax, dayString,
+            ha='center', va='bottom', fontweight='bold', fontsize=11, color='#333333'
+        )
+
+    endDate = simStart + timedelta(days=config.simDays - 1)
+    startStr = f"{simStart.day} {monthNames[simStart.month - 1]}"
+    endStr = f"{endDate.day} {monthNames[endDate.month - 1]}"
+
+    ax.set_title(f"Redistribution Gantt ({scenarioName}) — {config.weeksToCollapse} Weeks Collapsed\n({startStr} - {endStr})", fontsize=15, fontweight='bold', pad=35)
+
+    legendPatches = [
+        mpatches.Patch(color='#D32F2F', label='Urgency'),
+        mpatches.Patch(color='#1565C0', label='Elective')
+    ]
+    ax.legend(handles=legendPatches, loc='lower right', framealpha=1.0)
+
+    for spine in ["top", "right", "left", "bottom"]:
+        ax.spines[spine].set_color("#CCCCCC")
+
+    plt.tight_layout()
+    outPath = OUTPUT_DIR / f"gantt_{scenarioName}.png"
+    plt.savefig(outPath, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Redistribution Gantt chart exported as '{outPath}'")
+
+# --- MAIN EXECUTION ---
+def main():
+    config = RedistConfig()
+    print(f"Loading and collapsing data ({config.weeksToCollapse} weeks)...")
+    baseUrgencies, baseElectives, simStart = loadRedistData(config)
+
+    print("\n--- RUNNING REDISTRIBUTION SCENARIOS ---")
+
+    for strategy in config.strategies:
+        for heuristic in config.heuristics:
+            import copy
+            urgs = copy.deepcopy(baseUrgencies)
+            elecs = copy.deepcopy(baseElectives)
+
+            engine = RedistEngine(urgs, elecs, simStart, heuristic, strategy, config)
+            results = engine.run()
+
+            metrics = calculateRedistMetrics(results, config)
+            scenarioStr = f"{strategy}_{heuristic}"
+
+            print(f"[{scenarioStr.ljust(15)}] Throughput: {metrics['Throughput']} | Lead Time: {metrics['LeadTimeDays']}d | Util(Total): {metrics['UtilGlobal%']}% | Util(Elec): {metrics['UtilElec%']}% | Util(Urg): {metrics['UtilUrg%']}%")
+
+            drawRedistGantt(results, config, scenarioStr)
+
+    print("\nRedistribution matrices evaluated and Gantts exported successfully.")
+
+main()
